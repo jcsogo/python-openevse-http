@@ -698,10 +698,6 @@ class OpenEVSE:
         mode = self._status["divertmode"]
         if mode == 1:
             return "normal"
-<<<<<<< HEAD
-        else:
-            return "eco"
-=======
         return "eco"
 
     @property
@@ -727,7 +723,6 @@ class OpenEVSE:
         """Return if divert is active."""
         assert self._status is not None
         return self._status["divert_active"]
->>>>>>> upstream/dev
 
     # There is currently no min/max amps JSON data
     # available via HTTP API methods
