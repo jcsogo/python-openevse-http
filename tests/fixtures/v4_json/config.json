@@ -2,7 +2,8 @@
     "firmware": "7.1.3",
     "protocol": "-",
     "espflash": 4194304,
-    "version": "4.0.0",
+    "wifi_serial": "1234567890AB",
+    "version": "4.1.2",
     "diodet": 0,
     "gfcit": 0,
     "groundt": 0,
@@ -12,6 +13,9 @@
     "service": 2,
     "scale": 220,
     "offset": 0,
+    "max_current_soft": 48,
+    "min_current_hard": 6,
+    "max_current_hard": 48,    
     "mqtt_supported_protocols": [
       "mqtt",
       "mqtts"

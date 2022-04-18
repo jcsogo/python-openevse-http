@@ -1,7 +1,9 @@
 import asyncio
 import json
+from unittest import mock
 
 import logging
+from aiohttp.client_exceptions import ContentTypeError, ServerTimeoutError
 
 import pytest
 
@@ -11,6 +13,7 @@ pytestmark = pytest.mark.asyncio
 
 TEST_URL_RAPI = "http://openevse.test.tld/r"
 TEST_URL_OVERRIDE = "http://openevse.test.tld/override"
+TEST_URL_CONFIG = "http://openevse.test.tld/config"
 
 
 async def test_get_status_auth(test_charger_auth):
@@ -94,6 +97,28 @@ async def test_send_command_auth_err(test_charger_auth, mock_aioclient):
     with pytest.raises(openevsehttp.AuthenticationError):
         status = await test_charger_auth.send_command("test")
         assert status is None
+
+
+async def test_send_command_async_timeout(test_charger_auth, mock_aioclient, caplog):
+    """Test v4 Status reply"""
+    mock_aioclient.post(
+        TEST_URL_RAPI,
+        exception=TimeoutError,
+    )
+    with caplog.at_level(logging.DEBUG):
+        await test_charger_auth.send_command("test")
+    assert openevsehttp.ERROR_TIMEOUT in caplog.text
+
+
+async def test_send_command_server_timeout(test_charger_auth, mock_aioclient, caplog):
+    """Test v4 Status reply"""
+    mock_aioclient.post(
+        TEST_URL_RAPI,
+        exception=ServerTimeoutError,
+    )
+    with caplog.at_level(logging.DEBUG):
+        await test_charger_auth.send_command("test")
+    assert f"{openevsehttp.ERROR_TIMEOUT}: {TEST_URL_RAPI}" in caplog.text
 
 
 @pytest.mark.parametrize(
@@ -185,7 +210,7 @@ async def test_get_service_level(fixture, expected, request):
 
 
 @pytest.mark.parametrize(
-    "fixture, expected", [("test_charger", "4.0.0"), ("test_charger_v2", "2.9.1")]
+    "fixture, expected", [("test_charger", "4.1.2"), ("test_charger_v2", "2.9.1")]
 )
 async def test_get_wifi_firmware(fixture, expected, request):
     """Test v4 Status reply"""
@@ -296,7 +321,7 @@ async def test_get_wifi_signal(fixture, expected, request):
 
 
 @pytest.mark.parametrize(
-    "fixture, expected", [("test_charger", 0), ("test_charger_v2", 0)]
+    "fixture, expected", [("test_charger", 32.2), ("test_charger_v2", 0)]
 )
 async def test_get_charging_current(fixture, expected, request):
     """Test v4 Status reply"""
@@ -610,3 +635,88 @@ async def test_toggle_override_v2(test_charger_v2, mock_aioclient, caplog):
     with caplog.at_level(logging.DEBUG):
         await test_charger_v2.toggle_override()
     assert "Toggling manual override via RAPI" in caplog.text
+
+
+async def test_toggle_override_v2_err(test_charger_v2, mock_aioclient, caplog):
+    """Test v4 Status reply"""
+    await test_charger_v2.update()
+    content_error = mock.Mock()
+    setattr(content_error, "real_url", f"{TEST_URL_RAPI}")
+    mock_aioclient.post(
+        TEST_URL_RAPI,
+        exception=ContentTypeError(
+            content_error,
+            history="",
+            message="Attempt to decode JSON with unexpected mimetype: text/html",
+        ),
+    )
+    with caplog.at_level(logging.DEBUG):
+        await test_charger_v2.toggle_override()
+    assert (
+        "Toggle response: 0, message='Attempt to decode JSON with unexpected mimetype: text/html', url='http://openevse.test.tld/r'"
+        in caplog.text
+    )
+
+
+@pytest.mark.parametrize(
+    "fixture, expected", [("test_charger", "1234567890AB"), ("test_charger_v2", None)]
+)
+async def test_wifi_serial(fixture, expected, request):
+    """Test wifi_serial reply"""
+    charger = request.getfixturevalue(fixture)
+    await charger.update()
+    status = charger.wifi_serial
+    assert status == expected
+
+
+async def test_set_current(test_charger, mock_aioclient, caplog):
+    """Test v4 Status reply"""
+    await test_charger.update()
+    value = {"msg": "done"}
+    mock_aioclient.post(
+        TEST_URL_CONFIG,
+        status=200,
+        body=json.dumps(value),
+    )
+    with caplog.at_level(logging.DEBUG):
+        await test_charger.set_current(12)
+    assert "Setting max_current_soft to 12" in caplog.text
+
+
+async def test_set_current_error(test_charger, mock_aioclient, caplog):
+    """Test v4 Status reply"""
+    await test_charger.update()
+    mock_aioclient.post(
+        TEST_URL_CONFIG,
+        status=200,
+        body="OK",
+    )
+    with caplog.at_level(logging.DEBUG):
+        with pytest.raises(ValueError):
+            await test_charger.set_current(60)
+    assert "Invalid value for max_current_soft: 60" in caplog.text
+
+
+async def test_set_current_v2(test_charger_v2, mock_aioclient, caplog):
+    """Test v4 Status reply"""
+    await test_charger_v2.update()
+    value = {"cmd": "OK", "ret": "$OK^20"}
+    mock_aioclient.post(
+        TEST_URL_RAPI,
+        status=200,
+        body=json.dumps(value),
+    )
+    with caplog.at_level(logging.DEBUG):
+        await test_charger_v2.set_current(12)
+    assert "Setting current via RAPI" in caplog.text
+
+
+@pytest.mark.parametrize(
+    "fixture, expected", [("test_charger", 7728), ("test_charger_v2", 0)]
+)
+async def test_get_charging_power(fixture, expected, request):
+    """Test v4 Status reply"""
+    charger = request.getfixturevalue(fixture)
+    await charger.update()
+    status = charger.charging_power
+    assert status == expected

@@ -8,6 +8,7 @@ from json.decoder import JSONDecodeError
 from typing import Any, Callable, Optional
 
 import aiohttp  # type: ignore
+from aiohttp.client_exceptions import ContentTypeError, ServerTimeoutError
 from awesomeversion import AwesomeVersion
 
 from .const import MAX_AMPS, MIN_AMPS
@@ -40,7 +41,7 @@ states = {
 ERROR_AUTH_FAILURE = "Authorization failure"
 ERROR_TOO_MANY_RETRIES = "Too many retries"
 ERROR_UNKNOWN = "Unknown"
-ERROR_TIMEOUT = "Timeout while updating "
+ERROR_TIMEOUT = "Timeout while updating"
 
 INFO_LOOP_RUNNING = "Event loop already running, not creating new one."
 
@@ -197,30 +198,48 @@ class OpenEVSE:
 
         async with aiohttp.ClientSession() as session:
             http_method = getattr(session, method)
-            async with http_method(url, data=data, auth=auth) as resp:
-                try:
-                    message = await resp.json()
-                except TimeoutError:
-                    _LOGGER.error("%s: %s", ERROR_TIMEOUT, url)
-                except JSONDecodeError:
-                    message = {"msg": resp}
+            _LOGGER.debug(
+                "Connecting to %s with data payload of %s using method %s",
+                url,
+                data,
+                method,
+            )
+            try:
+                async with http_method(url, json=data, auth=auth) as resp:
+                    try:
+                        message = await resp.json()
+                    except JSONDecodeError:
+                        _LOGGER.error("Problem decoding JSON: %s", resp)
+                        message = {"msg": resp}
 
-                if resp.status == 400:
-                    _LOGGER.error("%s", message["msg"])
-                    raise ParseJSONError
-                if resp.status == 401:
-                    error = await resp.text()
-                    _LOGGER.error("Authentication error: %s", error)
-                    raise AuthenticationError
-                if resp.status == 404:
-                    _LOGGER.error("%s", message["msg"])
-                    raise UnknownError
-                if resp.status == 405:
-                    _LOGGER.error("%s", message["msg"])
-                elif resp.status == 500:
-                    _LOGGER.error("%s", message["msg"])
+                    if resp.status == 400:
+                        _LOGGER.error("Error 400: %s", message["msg"])
+                        raise ParseJSONError
+                    if resp.status == 401:
+                        error = await resp.text()
+                        _LOGGER.error("Authentication error: %s", error)
+                        raise AuthenticationError
+                    if resp.status == 404:
+                        _LOGGER.error("%s", message["msg"])
+                        raise UnknownError
+                    if resp.status == 405:
+                        _LOGGER.error("%s", message["msg"])
+                    elif resp.status == 500:
+                        _LOGGER.error("%s", message["msg"])
 
-                return message
+                    return message
+
+            except TimeoutError:
+                _LOGGER.error(ERROR_TIMEOUT)
+                message = {"msg": ERROR_TIMEOUT}
+            except ServerTimeoutError:
+                _LOGGER.error("%s: %s", ERROR_TIMEOUT, url)
+                message = {"msg": ERROR_TIMEOUT}
+            except ContentTypeError as err:
+                _LOGGER.error("%s", err)
+                message = {"msg": err}
+
+            return message
 
     async def send_command(self, command: str) -> tuple | None:
         """Send a RAPI command to the charger and parses the response."""
@@ -230,6 +249,8 @@ class OpenEVSE:
         _LOGGER.debug("Posting data: %s to %s", command, url)
         value = await self.process_request(url=url, method="post", data=data)
         if "ret" not in value:
+            if "msg" in value:
+                return False, value["msg"]
             return False, ""
         return value["cmd"], value["ret"]
 
@@ -421,7 +442,7 @@ class OpenEVSE:
 
         _LOGGER.debug("Detected firmware: %s", current)
 
-        if cutoff <= current:
+        if current >= cutoff:
             url = f"{self.url}override"
 
             _LOGGER.debug("Toggling manual override %s", url)
@@ -430,7 +451,7 @@ class OpenEVSE:
         else:
             # Older firmware use RAPI commands
             _LOGGER.debug("Toggling manual override via RAPI")
-            command = "$FE" if self._status["state"] == "sleeping" else "$FS"
+            command = "$FE" if self._status["state"] == 254 else "$FS"
             response = await self.send_command(command)
             _LOGGER.debug("Toggle response: %s", response[1])
 
@@ -441,6 +462,38 @@ class OpenEVSE:
         _LOGGER.debug("Clearing manual overrride %s", url)
         response = await self.process_request(url=url, method="delete")
         _LOGGER.debug("Toggle response: %s", response["msg"])
+
+    async def set_current(self, amps: int = 6) -> None:
+        """Set the soft current limit."""
+        #   3.x - 4.1.0: use RAPI commands $SC <amps>
+        #   4.1.2: use HTTP API call
+        amps = int(amps)
+        cutoff = AwesomeVersion("4.1.2")
+        current = AwesomeVersion(self._config["version"])
+
+        if current >= cutoff:
+            url = f"{self.url}config"
+
+            if (
+                amps < self._config["min_current_hard"]
+                or amps > self._config["max_current_hard"]
+            ):
+                _LOGGER.error("Invalid value for max_current_soft: %s", amps)
+                raise ValueError
+
+            data = {"max_current_soft": amps}
+
+            _LOGGER.debug("Setting max_current_soft to %s", amps)
+            response = await self.process_request(
+                url=url, method="post", data=data
+            )  # noqa: E501
+
+        else:
+            # RAPI commands
+            _LOGGER.debug("Setting current via RAPI")
+            command = f"$SC {amps}"
+            response = await self.send_command(command)
+            _LOGGER.debug("Set current response: %s", response[1])
 
     @property
     def hostname(self) -> str:
@@ -724,14 +777,35 @@ class OpenEVSE:
         assert self._status is not None
         return self._status["divert_active"]
 
+    @property
+    def wifi_serial(self) -> str | None:
+        """Return wifi serial."""
+        if self._config is not None and "wifi_serial" in self._config:
+            return self._config["wifi_serial"]
+        return None
+
+    @property
+    def charging_power(self) -> float:
+        """Return the charge power.
+
+        Calculate Watts base on V*I
+        """
+        assert self._status is not None
+        value = round(self._status["voltage"] * self._status["amp"], 2)
+        return value
+
     # There is currently no min/max amps JSON data
     # available via HTTP API methods
     @property
     def min_amps(self) -> int:
         """Return the minimum amps."""
+        if self._config is not None and "min_current_hard" in self._config:
+            return self._config["min_current_hard"]
         return MIN_AMPS
 
     @property
     def max_amps(self) -> int:
         """Return the maximum amps."""
+        if self._config is not None and "max_current_hard" in self._config:
+            return self._config["max_current_hard"]
         return MAX_AMPS
